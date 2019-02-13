@@ -1,8 +1,8 @@
 module profcov
   use hdf5
+  use precision
   implicit none
-  integer, parameter :: dp=selected_real_kind(12), &
-                        wp=dp
+  integer, parameter, private :: wp=dp
   real(wp), parameter :: &
        pi=3.1415926535897931159979634685441851615906_wp, &
        degree=pi/180.0_wp
@@ -84,14 +84,77 @@ contains
     call h5sclose_f(mid,error)
   end subroutine h5reada4
 
+  ! Hypsometric thickness of a layer defined by two pressure
+  ! boundaries p1 and p2
+  ! p1 - [Pa]
+  ! p2 - [Pa]
+  ! T  - [K]
+  ! dz - [m]
+  elemental function hypsometric(p1,p2,T) result(dz)
+    real(wp), intent(in) :: p1,p2,T
+    real(wp) :: dz
+    real(wp), parameter :: &
+         Rd=287.0_wp, & ! [J/K/kg]
+         g0=9.81_wp     ! [m/s^2]
+
+    dz=Rd*T/g0*(log(p1)-log(p2))
+  end function hypsometric
+
+  subroutine test_refraction(nu,p,temp,rho_H2O,theta,verbose,x)
+    use bodhaine
+    real, intent(in) :: p(:),temp(:)
+    real(dp), intent(in) :: nu,rho_H2O
+    real(dp), intent(inout) :: theta
+    real(dp) :: dn,dn_prev
+    integer :: i,m
+    real(dp), parameter :: atm=101325d0,mbar=1d2
+    real(dp) :: X_CO2,s,dz,z_tot
+    real(dp), intent(out) :: x
+    logical, intent(in) :: verbose
+
+    m=size(p)
+
+    ! 1 atm=101325 Pa
+    ! 1 bar=1e5 Pa
+    !nu=1e7_wp/11300
+    !nu=1e7_wp/5000
+    !rho_H2O=1e3_wp
+    X_CO2=400.0_wp
+    s=sin(theta)
+    x=0
+    dn_prev=0
+    z_tot=0
+
+    do i=1,m-1
+       dn=n_air_minus_1(nu,p(i)*mbar/atm,real(temp(i),dp),rho_H2O,X_CO2)
+       dz=hypsometric(p(i)*mbar,p(i+1)*mbar,real(temp(i)+temp(i+1),dp)/2)
+       z_tot=z_tot+dz
+       x=x+tan(s)*dz
+       if (verbose) then
+          write (*,'(I2,1X,F6.1,1X,F7.3,1X,EN22.12,3(1X,EN22.12))') i,p(i),temp(i),theta/degree,dn,dz,x
+       end if
+       s=(1+dn)/(1+dn_prev)*s
+       theta=asin(s)
+    end do
+    if (verbose) then
+       print *,z_tot
+    end if
+  end subroutine test_refraction
+
   subroutine test
     integer(hid_t) :: fid
     integer :: error
     integer(hsize_t) :: nlat,nlon,nlev,ntime,ntemp(4)
     real, allocatable :: lats(:),lons(:),levs(:),times(:),temp(:,:,:,:),mu_temp(:)
     real(dp), allocatable :: cov_temp(:,:)
+    real(dp) :: x,theta,sx,sxx,ex,exx
     character(len=:), allocatable :: fn
-    integer(hsize_t) :: ilat,ilon,ilev,itime,ilev1,ilev2,ncov
+    integer(hsize_t) :: ilat,ilat2,ilon,ilon2,ilev,itime,ilev1,ilev2,ncov,nx,ilambda,ih2o
+    real(dp), parameter :: lambdas(*)=[5.0,15.0], & !,1.0,5.0,10.0,15.0]
+                           h2os(*)=[1e2,5e4] !2e2,5e2,1e3,2e3,5e3,1e4,2e4,5e4]
+    logical :: first
+
+    first=.true.
 
     call getarg(1,fn)
 
@@ -108,6 +171,37 @@ contains
     print *,'t:',shape(temp)
     print *,'t:',ntemp
 
+    ! Refraction test
+    ilat=(1+nlat)/2
+    itime=1
+    do ih2o=1,size(h2os)
+    do ilambda=1,size(lambdas)
+       sx=0
+       sxx=0
+       nx=0
+       do ilat=(1+nlat)/2-90,(1+nlat)/2+90
+          do ilon=1,nlon
+             x=0
+             theta=85*degree
+             call test_refraction(1e4/lambdas(ilambda),levs,temp(ilon,ilat,:,itime),&
+                  h2os(ih2o),theta,first,x)
+             first=.false.
+             sx=sx+x
+             sxx=sxx+x*x
+             nx=nx+1
+             ! write (*,'(2(1X,EN22.12))') theta,x
+          end do
+       end do
+       ex=sx/nx
+       exx=sxx/nx
+       write (*,'(F8.3,1X,ES14.7,1X,A8,1X,EN22.12,A8,1X,EN22.12)') &
+            lambdas(ilambda),h2os(ih2o),'X:mu=',ex,'sigma=',sqrt(exx-ex*ex)
+    end do
+ end do
+
+    return
+
+    ! Covariance
     write (*,'(A2,1X,A8,1X,A8)') '#','p [mbar]','T [K]'
     allocate(mu_temp(nlev),cov_temp(nlev,nlev))
     do ilev=1,nlev
@@ -121,9 +215,11 @@ contains
           do ilon=1,nlon
              do ilev1=1,nlev
                 do ilev2=ilev1,nlev
+                   ilat2=modulo(ilat+1,nlat)+1
+                   ilon2=ilon !modulo(ilon-1,nlon)+1
                    cov_temp(ilev1,ilev2)=cov_temp(ilev1,ilev2)+ &
                         (temp(ilon,ilat,ilev1,itime)-mu_temp(ilev1))* &
-                        (temp(ilon,ilat,ilev2,itime)-mu_temp(ilev2))
+                        (temp(ilon2,ilat2,ilev2,itime)-mu_temp(ilev2))
                 end do
              end do
           end do

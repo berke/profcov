@@ -20,7 +20,7 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -I/usr/include/x86_64-linux-gnu -Wall -g -O3
 find_package(sexptran-${CMAKE_Fortran_COMPILER_ID} 1.3.1 REQUIRED )
 include_directories("${sexptran_INCLUDE_DIRS}" )
 
-set(SRCS profcov.f90)
+set(SRCS profcov.f90 bodhaine.f90 precision.f90)
 
 set(LAPACK_LIBS blas lapack)
 
