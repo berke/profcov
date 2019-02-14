@@ -7,7 +7,212 @@ module profcov
        pi=3.1415926535897931159979634685441851615906_wp, &
        degree=pi/180.0_wp
   complex(wp), parameter :: imag=(0.0_wp,1.0_wp)
+
+  type, abstract :: boundary
+   contains
+     procedure(next_boundary_intf), deferred :: next
+  end type boundary
+
+  type, abstract :: interaction
+     ! k0 : current element
+     ! p0 : position within k0
+     ! u0 : direction
+     ! k1 : next element
+     ! p1 : position at interface
+     ! v1 : normal at interface point
+     ! u1 : new direction
+   contains
+     procedure(interact_intf), deferred :: interact
+  end type interaction
+
+  abstract interface
+       ! k0       : current element
+       ! p0       : current position
+       ! u0       : current direction normal
+       ! k1       : next element
+       ! p1       : position at next boundary following u0
+       ! v1       : boundary normal at p1
+       subroutine next_boundary_intf(this,k0,p0,u0,k1,p1,v1)
+         import
+         class(boundary) :: this
+         integer, intent(in) :: k0
+         real(dp), intent(in) :: p0(3),u0(3)
+         integer, intent(out) :: k1
+         real(dp), intent(out) :: p1(3),v1(3)
+       end subroutine next_boundary_intf
+
+     subroutine interact_intf(this,k0,u0,k1,v1,u1)
+       import
+       class(interaction) :: this
+       integer, intent(in) :: k0,k1
+       real(dp), intent(in) :: u0(3),v1(3)
+       real(dp), intent(out) :: u1(3)
+     end subroutine interact_intf
+  end interface
+
+  type, extends(interaction) :: snell_descartes
+     real(dp), allocatable :: indices(:)
+   contains
+     procedure :: interact=>snde_interact
+  end type snell_descartes
+
+  type, extends(boundary) :: cylindrical
+     real(dp), allocatable :: rs(:) ! Radiuses, decreasing
+   contains
+     procedure :: next=>cyl_next
+  end type cylindrical
 contains
+  subroutine quadr(a,b,c,x,n)
+    real(dp), intent(in) :: a,b,c
+    real(dp), intent(out) :: x(2)
+    integer, intent(out) :: n
+    real(dp) :: delta,t
+
+    !     ax^2+bx+c=0
+    !     x^2 + xb/a + c/a=0             DIVIDE BY a
+    ! (1) x^2 + xb/a = -c/a              SUBSTRACT c/a
+    !
+    ! (x+b/(2a))^2
+    !   = x^2+b^2/(4a^2)+2xb/(2a)
+    !   = x^2+b^2/(4a^2)+xb/a       SIMPLIFY
+    !
+    ! THUS
+    !
+    ! (2) (x+b/(2a))^2-b^2/(4a^2) = x^2+xb/a
+    !
+    ! SUBSTITUTING (2) INTO (1)
+    !
+    ! (3) (x+b/(2a))^2-b^2/(4a^2) = -c/a
+    !     (x+b/(2a))^2 = b^2/(4a^2) - c/a
+    !
+    ! THEREFORE
+    !
+    !     (x+b/(2a)) = ±sqrt(b^2/(4a^2) - c/a)
+    !              x = ±sqrt(-c/a+b^2/(4a^2))-b/(2a)
+    !
+    ! b^2/(4a^2)-c/a=
+    ! b^2/(4a^2)-ac/aa=
+    ! (b^2-ac)/(4a^2)
+    delta=b*b/(4*a*a)-c/a
+    if (delta<0) then
+       ! No real solutions
+       n=0
+    else
+       t=-b/(2*a)
+       if (abs(delta)<epsilon(delta)) then
+          ! One solution
+          x(1)=t
+          n=1
+       else
+          delta=sqrt(delta)
+          x(1)=-delta+t
+          x(2)=delta+t
+          n=2
+       end if
+    end if
+  end subroutine quadr
+
+  subroutine cyl_next(this,k0,p0,u0,k1,p1,v1)
+    class(cylindrical) :: this
+    integer, intent(in) :: k0
+    real(dp), intent(in) :: p0(3),u0(3)
+    integer, intent(out) :: k1
+    real(dp), intent(out) :: p1(3),v1(3)
+    real(dp) :: r0,r1,ur,p0u0,lams(2)
+    integer :: nlam
+
+    ! Cylinder axis: z-axis
+    ur=hypot(u0(1),u0(2))
+    if (ur<=epsilon(ur)) error stop 'Motion parallel to axis'
+    r0=hypot(p0(1),p0(2))
+    p0u0=dot_product(p0(1:2),u0(1:2))
+    if (p0u0<0) then
+       ! Radius is decreasing
+       if (k0 < size(this%rs)) then
+          k1=k0+1
+       else
+          k1=k0
+       end if
+    else
+       if (k0 > 1) then
+          k1=k0-1
+       else
+          k1=k0
+       end if
+    end if
+    ! TODO: Fix logic
+
+    r1=this%rs(k1)
+    ! ||p0(1:2)+lam*u0(1:2)||^2=r1^2
+    ! (p0(1)+lam*u0(1))^2 + (p0(2)+lam*u0(2))^2 = r1^2
+    !
+    ! p0(1)^2 + lam^2*u0(1))^2 + 2*p0(1)*lam*u0(1)
+    !   + p0(2)^2 + lam^2*u0(2))^2 + 2*p0(2)*lam*u0(2) = r1^2
+    !
+    ! (p0(1)^2 + p0(2)^2)
+    !   + 2*(p0(1)*u0(1)+p0(2)*u0(2))*lam
+    !   + lam^2*(u0(1)^2 + u0(2)^2) = r1^2
+    !
+    ! r0^2
+    !   + 2*(p0(1)*u0(1)+p0(2)*u0(2))*lam
+    !   + lam^2*(u0(1)^2 + u0(2)^2) = r1^2
+    !
+    !     2*(p0(1)*u0(1)+p0(2)*u0(2))*lam
+    !   + lam^2*(u0(1)^2 + u0(2)^2) = r1^2-r0^2
+    !
+    ! ||p+Lu||=R
+    ! <p+Lu|p+Lu>=R^2
+    ! <p|p>+2<p|Lu>+<Lu|Lu>=R^2
+    ! <p|p>+L 2<p|u>+L^2 <u|u>=R^2
+    ! <p|p>+L 2<p|u>+L^2 <u|u>-R^2=0
+    ! (<p|p>-R^2)+L 2<p|u>+L^2 <u|u>=0
+    call quadr(ur*ur,2*p0u0,r0*r0-r1*r1,lams,nlam)
+    if (nlam==0) then
+       k1=-1
+       return
+    else
+       p1=p0+lams(1)*u0
+       if (dot_product(p1-p0,u0)<0) then
+          if (nlam==1) then
+             k1=-1
+             return
+          else
+             p1=p0+lams(2)*u0
+          end if
+       end if
+    end if
+
+    v1(1)=p1(2)
+    v1(2)=-p1(1) ! Orientation?
+    v1(3)=0
+    v1=v1/norm2(v1)
+  end subroutine cyl_next
+
+  subroutine snde_interact(this,k0,u0,k1,v1,u1)
+    class(snell_descartes) :: this
+    integer, intent(in) :: k0,k1
+    real(dp), intent(in) :: u0(3),v1(3)
+    real(dp), intent(out) :: u1(3)
+    real(dp) :: n0,n1,u0v1(3),u0nv1(3),nu0nv1,u1v1(3),u1nv1(3)
+
+    n0=this%indices(k0)
+    n1=this%indices(k1)
+
+    ! Decompose u0 along v1 and v1*
+    u0v1=dot_product(u0,v1)
+    u0nv1=u0-u0v1*v1
+    nu0nv1=norm2(u0nv1)
+    if (nu0nv1<=epsilon(nu0nv1)) then
+       ! Orthogonal
+       u1=u0
+       return
+    end if
+    u1v1=u0v1
+    u1nv1=n0/n1*u0nv1
+    u1=u1v1*v1+u1nv1*u0nv1/nu0nv1
+    u1=u1/norm2(u1)
+  end subroutine snde_interact
+    
   subroutine getarg(k,u)
     integer, intent(in) :: k
     integer :: m
@@ -100,6 +305,41 @@ contains
     dz=Rd*T/g0*(log(p1)-log(p2))
   end function hypsometric
 
+  subroutine ray_trace(k0,p0,u0,bnd,inter,k_final,p_final,u_final)
+    integer, intent(in) :: k0,k_final
+    real(dp), intent(in) :: p0(3),u0(3)
+    real(dp), intent(out) :: p_final(3),u_final(3)
+    integer :: k1,k2
+    real(dp) :: p1(3),u1(3),v2(3),p2(3),u2(3)
+    class(boundary) :: bnd
+    class(interaction) :: inter
+
+    p1=p0
+    k1=k0
+    u1=u0
+    
+    do
+       write (*,'(I2," P",3(1X,F8.4)," U",3(1X,ES11.3))') k1,p1,u1
+       if (k1==k_final) then
+          p_final=p1
+          u_final=u1
+          exit
+       end if
+          
+       call bnd%next(k1,p1,u1,k2,p2,v2)
+       if (k2<0) then
+          write (*,'(A)') "STOP"
+          exit
+       end if
+       call inter%interact(k1,u1,k2,v2,u2)
+       p1=p2
+       k1=k2
+       u1=u2
+    end do
+    p_final=p1
+    u_final=u1
+  end subroutine ray_trace
+
   subroutine test_refraction(nu,p,temp,rho_H2O,theta,verbose,x)
     use bodhaine
     real, intent(in) :: p(:),temp(:)
@@ -175,29 +415,29 @@ contains
     ilat=(1+nlat)/2
     itime=1
     do ih2o=1,size(h2os)
-    do ilambda=1,size(lambdas)
-       sx=0
-       sxx=0
-       nx=0
-       do ilat=(1+nlat)/2-90,(1+nlat)/2+90
-          do ilon=1,nlon
-             x=0
-             theta=85*degree
-             call test_refraction(1e4/lambdas(ilambda),levs,temp(ilon,ilat,:,itime),&
-                  h2os(ih2o),theta,first,x)
-             first=.false.
-             sx=sx+x
-             sxx=sxx+x*x
-             nx=nx+1
-             ! write (*,'(2(1X,EN22.12))') theta,x
+       do ilambda=1,size(lambdas)
+          sx=0
+          sxx=0
+          nx=0
+          do ilat=(1+nlat)/2-90,(1+nlat)/2+90
+             do ilon=1,nlon
+                x=0
+                theta=85*degree
+                call test_refraction(1e4/lambdas(ilambda),levs,temp(ilon,ilat,:,itime),&
+                     h2os(ih2o),theta,first,x)
+                first=.false.
+                sx=sx+x
+                sxx=sxx+x*x
+                nx=nx+1
+                ! write (*,'(2(1X,EN22.12))') theta,x
+             end do
           end do
+          ex=sx/nx
+          exx=sxx/nx
+          write (*,'(F8.3,1X,ES14.7,1X,A8,1X,EN22.12,A8,1X,EN22.12)') &
+               lambdas(ilambda),h2os(ih2o),'X:mu=',ex,'sigma=',sqrt(exx-ex*ex)
        end do
-       ex=sx/nx
-       exx=sxx/nx
-       write (*,'(F8.3,1X,ES14.7,1X,A8,1X,EN22.12,A8,1X,EN22.12)') &
-            lambdas(ilambda),h2os(ih2o),'X:mu=',ex,'sigma=',sqrt(exx-ex*ex)
     end do
- end do
 
     return
 
@@ -238,11 +478,28 @@ contains
        write (*,'()')
     end do
   end subroutine test
+
+  subroutine test_cylref
+    type(cylindrical) :: cyl
+    type(snell_descartes) :: snl
+    integer, parameter :: n=5
+    real(dp) :: p0(3),u0(3),p1(3),u1(3)
+    integer :: k0,k1
+
+    allocate(cyl%rs(n),snl%indices(n))
+    cyl%rs=[10.0,5.0,3.0,2.0,0.5]
+    snl%indices=[1.0,1.3,1.1,1.25,1.2]
+    p0=[-20.0,0.5,0.123]
+    u0=[0.22,0.0,0.1]
+    u0=u0/norm2(u0)
+    k0=1
+    call ray_trace(k0,p0,u0,cyl,snl,n,p1,u1) 
+  end subroutine test_cylref
 end module profcov
 
 program profcov_p
   use profcov
   implicit none
 
-  call test
+  call test_cylref
 end program profcov_p
